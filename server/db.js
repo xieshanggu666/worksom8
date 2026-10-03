@@ -942,6 +942,7 @@ CREATE INDEX IF NOT EXISTS idx_stock_move_mat ON stock_movements(material_id,id)
 CREATE TABLE IF NOT EXISTS stock_lost_sales (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   vendor_id INTEGER NOT NULL,
+  merchant_id INTEGER,                 -- 联营商户缺货流失（vendor_id=0 时以此标记归属）
   material_id INTEGER,
   qty_lost REAL NOT NULL DEFAULT 0,
   lost_rev INTEGER NOT NULL DEFAULT 0,
@@ -1005,6 +1006,173 @@ CREATE TABLE IF NOT EXISTS purchase_logs (
   note TEXT NOT NULL DEFAULT '',
   staff_id INTEGER
 );
+
+-- ========================================================================
+-- 园区联营商户结算：商户申请入驻 → 审核签约收保证金 → 销售流水按比例分账
+--   （联动 FEFO 库存消耗 / 会员折扣积分 / 投诉违约扣款 / 退货退款冲账）
+--   → 周期结算单（园方佣金 + 商户应分）→ 财务付款结清 → 解约退保证金
+-- 资金口径：销售款由园区统一收银（全额现金流入），结算时才把商户分成付出；
+--          保证金/违约扣款/退货冲减全部在结算单内逐笔留痕、可对账。
+-- ========================================================================
+
+-- 联营商户档案（申请→审核→签约→营业/暂停→解约全状态机）
+CREATE TABLE IF NOT EXISTS merchants (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL DEFAULT '',           -- LY0001
+  name TEXT NOT NULL,                      -- 商户/品牌名称
+  contact TEXT NOT NULL DEFAULT '',        -- 联系人
+  phone TEXT NOT NULL DEFAULT '',
+  category TEXT NOT NULL DEFAULT '餐饮',   -- 餐饮/饮品/文创/零售/游乐服务
+  zone_id INTEGER NOT NULL DEFAULT 1,      -- 经营区域
+  price INTEGER NOT NULL DEFAULT 25,       -- 客单价（元/件）
+  commission_rate REAL NOT NULL DEFAULT 0.2, -- 园区抽成比例（0~1）：销售额 × 比例 = 园方佣金
+  deposit INTEGER NOT NULL DEFAULT 5000,   -- 签约保证金（商户缴纳，解约无未了事项时退还）
+  status TEXT NOT NULL DEFAULT 'applied',  -- applied 待审核 / rejected 已驳回 / signed 已签约待开业 /
+                                           -- operating 营业中 / suspended 已暂停 / terminated 已解约
+  apply_note TEXT NOT NULL DEFAULT '',     -- 入驻申请说明
+  reject_reason TEXT NOT NULL DEFAULT '',
+  contract_day INTEGER NOT NULL DEFAULT 0, -- 签约游戏日
+  contract_periods INTEGER NOT NULL DEFAULT 30, -- 签约周期（游戏日）
+  expire_day INTEGER NOT NULL DEFAULT 0,   -- 合同到期游戏日
+  last_settle_day INTEGER NOT NULL DEFAULT 0,   -- 已结算至游戏日（半开区间：下一单从该日+1起，签约前为签约日-1）
+  deposit_paid INTEGER NOT NULL DEFAULT 0, -- 已收保证金
+  deposit_refunded INTEGER NOT NULL DEFAULT 0,  -- 已退保证金
+  sales_qty INTEGER NOT NULL DEFAULT 0,    -- 累计销售件数
+  sales_amount INTEGER NOT NULL DEFAULT 0, -- 累计销售流水（实付，元）
+  commission_amount INTEGER NOT NULL DEFAULT 0, -- 累计园方佣金
+  merchant_amount INTEGER NOT NULL DEFAULT 0,   -- 累计商户应分（未扣调整前的理论分成）
+  settled_amount INTEGER NOT NULL DEFAULT 0,    -- 累计已结算支付给商户金额
+  fine_amount INTEGER NOT NULL DEFAULT 0,      -- 累计违约扣款（投诉处罚等）
+  refund_amount INTEGER NOT NULL DEFAULT 0,    -- 累计退货退款金额
+  approver_id INTEGER,
+  create_tick INTEGER NOT NULL DEFAULT 0,
+  create_day INTEGER NOT NULL DEFAULT 0,
+  sign_tick INTEGER NOT NULL DEFAULT 0,
+  close_tick INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_merchants_status ON merchants(status);
+
+-- 联营商户 ↔ 物资：商户销售受库存联动的物资（复用 FEFO 批次/盘点/采购体系；未配置则不受库存约束）
+CREATE TABLE IF NOT EXISTS merchant_materials (
+  merchant_id INTEGER NOT NULL,
+  material_id INTEGER NOT NULL,
+  PRIMARY KEY (merchant_id, material_id)
+);
+
+-- 联营销售流水（园区统一收银逐笔落账：散客/会员，含会员折扣、积分与分账拆分）
+CREATE TABLE IF NOT EXISTS merchant_sales (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL DEFAULT '',           -- LS0001
+  merchant_id INTEGER NOT NULL,
+  qty INTEGER NOT NULL DEFAULT 1,
+  price REAL NOT NULL DEFAULT 0,           -- 成交单价（会员折后可能非整数，金额 = qty×price 恒等）
+  amount INTEGER NOT NULL DEFAULT 0,       -- 实收金额 = qty×price（园区现金流入）
+  discount_amount INTEGER NOT NULL DEFAULT 0, -- 会员优惠减免（牌价应收 - 实收）
+  commission INTEGER NOT NULL DEFAULT 0,   -- 本笔园方佣金
+  merchant_share INTEGER NOT NULL DEFAULT 0, -- 本笔商户应分
+  source TEXT NOT NULL DEFAULT 'guest',    -- guest 散客 / member 会员 / auto 引擎模拟
+  member_id INTEGER,
+  member_tier TEXT NOT NULL DEFAULT '',
+  points_awarded INTEGER NOT NULL DEFAULT 0, -- 本笔会员获赠积分
+  settle_id INTEGER,                       -- 已归入的结算单（NULL=未结算）
+  day INTEGER NOT NULL,
+  tick INTEGER NOT NULL DEFAULT 0,
+  note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_msales_merchant ON merchant_sales(merchant_id,day);
+CREATE INDEX IF NOT EXISTS idx_msales_settle ON merchant_sales(settle_id);
+
+-- 联营退货退款：冲减销售（未结算直接红冲；已结算结转下期商户承担），库存 FEFO 回补，会员积分回退
+CREATE TABLE IF NOT EXISTS merchant_refunds (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL DEFAULT '',           -- LT0001
+  merchant_id INTEGER NOT NULL,
+  sale_id INTEGER,                         -- 关联原销售流水（可空：无单退货）
+  qty INTEGER NOT NULL DEFAULT 1,
+  amount INTEGER NOT NULL DEFAULT 0,       -- 退款金额（园区现金流出）
+  commission_back INTEGER NOT NULL DEFAULT 0,  -- 冲减园方佣金
+  merchant_back INTEGER NOT NULL DEFAULT 0,    -- 商户承担（冲其分成）
+  settled INTEGER NOT NULL DEFAULT 0,      -- 原销售是否已结算（已结算则结转下期调整）
+  settlement_id INTEGER,                   -- 退货被归集的结算单（NULL=未归集）
+  adjustment_id INTEGER,                   -- 已结算时生成的下期结转调整单
+  member_id INTEGER,
+  points_clawback INTEGER NOT NULL DEFAULT 0,  -- 会员积分回退
+  source TEXT NOT NULL DEFAULT 'manual',   -- manual 前台 / auto 引擎模拟
+  reason TEXT NOT NULL DEFAULT '',
+  day INTEGER NOT NULL,
+  tick INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_mrefunds_merchant ON merchant_refunds(merchant_id,day);
+
+-- 结算周期内商户账务调整：投诉违约扣款、已结算退货结转下期等（结算单生成时归集）
+CREATE TABLE IF NOT EXISTS merchant_adjustments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  merchant_id INTEGER NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'fine',       -- fine 投诉违约扣款 / refund_carry 已结算退货商户承担结转 / manual 人工调整
+  amount INTEGER NOT NULL DEFAULT 0,       -- 正=园区扣商户（商户少得）；负=园区补给商户
+  complaint_id INTEGER,
+  refund_id INTEGER,
+  settle_id INTEGER,                       -- 已归入的结算单（NULL=待结算）
+  note TEXT NOT NULL DEFAULT '',
+  staff_id INTEGER,
+  day INTEGER NOT NULL,
+  tick INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_madj_merchant ON merchant_adjustments(merchant_id,settle_id);
+
+-- 联营结算单：按周期归集销售分账 + 违约扣款 + 退货结转，商户应分净额；确认后财务付款结清
+CREATE TABLE IF NOT EXISTS merchant_settlements (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL DEFAULT '',           -- LC0001
+  merchant_id INTEGER NOT NULL,
+  day_from INTEGER NOT NULL,
+  day_to INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',  -- pending 待确认 / confirmed 已确认待付款 / paid 已付款结清
+  sales_qty INTEGER NOT NULL DEFAULT 0,
+  sales_amount INTEGER NOT NULL DEFAULT 0, -- 周期销售流水（实收）
+  commission_amount INTEGER NOT NULL DEFAULT 0, -- 周期园方佣金（含退货冲减后净额）
+  merchant_gross INTEGER NOT NULL DEFAULT 0,    -- 商户分成（含退货冲减后净额）
+  fine_amount INTEGER NOT NULL DEFAULT 0,       -- 周期违约扣款合计
+  adjust_amount INTEGER NOT NULL DEFAULT 0,     -- 其他调整净额（正=扣商户）
+  merchant_net INTEGER NOT NULL DEFAULT 0,      -- 实付商户 = 商户分成 - 扣款 - 调整
+  paid_amount INTEGER NOT NULL DEFAULT 0,
+  payment_id INTEGER,
+  note TEXT NOT NULL DEFAULT '',
+  creator_id INTEGER,
+  create_tick INTEGER NOT NULL DEFAULT 0,
+  create_day INTEGER NOT NULL DEFAULT 0,
+  confirm_tick INTEGER NOT NULL DEFAULT 0,
+  pay_tick INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_msettle_merchant ON merchant_settlements(merchant_id,status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_msettle_range ON merchant_settlements(merchant_id,day_from,day_to);
+
+-- 商户款项流水：保证金收取/退还、结算付款逐笔入财务，供对账
+CREATE TABLE IF NOT EXISTS merchant_payments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL DEFAULT '',           -- LP0001
+  merchant_id INTEGER NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'settle',     -- deposit 收保证金 / deposit_refund 退保证金 / settle 结算付款
+  amount INTEGER NOT NULL,                 -- 正=商户付给园区（保证金）；负=园区付给商户（退保证金/结算）
+  settlement_id INTEGER,
+  day INTEGER NOT NULL,
+  tick INTEGER NOT NULL DEFAULT 0,
+  note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_mpay_merchant ON merchant_payments(merchant_id);
+
+-- 联营商户生命周期时间线（申请/审核/签约/暂停/恢复/结算/付款/解约/违约/退货）
+CREATE TABLE IF NOT EXISTS merchant_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  merchant_id INTEGER NOT NULL,
+  tick INTEGER NOT NULL,
+  day INTEGER NOT NULL,
+  hour INTEGER NOT NULL DEFAULT 0,
+  action TEXT NOT NULL,
+  note TEXT NOT NULL DEFAULT '',
+  staff_id INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_mlogs_merchant ON merchant_logs(merchant_id);
 `)
 
 // ---------- 轻量列迁移（兼容老库） ----------
@@ -1025,6 +1193,12 @@ ensureColumn('staff_schedules', 'source', "source TEXT NOT NULL DEFAULT 'manual'
 ensureColumn('shift_requests', 'source', "source TEXT NOT NULL DEFAULT 'staff'")
 // 领队组团：source='group' 的预约单关联团行程明细 id（款项走团账，该预约 amount 恒为 0）
 ensureColumn('reservations', 'group_item_id', "group_item_id INTEGER")
+// 联营商户投诉联动：针对联营商户的投诉记 merchant 目标
+// （merchant 为独立表，无需在 complaints 加列，复用 target_type='merchant'/target_id）
+// 联营商户缺货流失归属（老库补列；商铺流失 merchant_id 恒 NULL）
+ensureColumn('stock_lost_sales', 'merchant_id', "merchant_id INTEGER")
+// 联营退货归集结算单（老库补列）
+ensureColumn('merchant_refunds', 'settlement_id', "settlement_id INTEGER")
 
 // ---------- 事务 ----------
 // 多步写入（库存/订单/现金/流水/日志）必须原子提交：任一步失败整体回滚，不留半完成状态。
@@ -1200,6 +1374,11 @@ function seed() {
   setIf('dispatchNightGuardsPerZone', 0)  // 夜勤保安区域配比（0=不强制）
   setIf('groupDepositRate', 0.3)          // 团队订金比例（运营确认时锁定名额并收取）
   setIf('groupEnabled', 1)                // 领队组团模块开关
+  setIf('merchantEnabled', 1)             // 园区联营商户模块开关
+  setIf('merchantDefaultCommission', 0.2) // 联营默认抽成比例
+  setIf('merchantDefaultDeposit', 5000)   // 联营默认保证金
+  setIf('merchantContractPeriods', 30)    // 默认签约周期（游戏日）
+  setIf('merchantAutoSettle', 1)          // 日结自动生成联营结算单
 
   // 示例会员（新库首日建立；含一名金卡会员便于演示等级与权益流转）
   if (db.prepare('SELECT COUNT(*) n FROM members').get().n === 0) {
@@ -1268,7 +1447,12 @@ function ensureScheduleBaseData() {
     ['dispatchCleanFlow', 700],
     ['dispatchNightGuardsPerZone', 0],  // 0=夜班不强制（按需动态补）；>0 时每 N 个区域至少 1 名夜勤保安
     ['groupDepositRate', 0.3],          // 团队订金比例
-    ['groupEnabled', 1]                 // 领队组团模块开关
+    ['groupEnabled', 1],                // 领队组团模块开关
+    ['merchantEnabled', 1],             // 园区联营商户模块开关
+    ['merchantDefaultCommission', 0.2], // 联营默认抽成比例
+    ['merchantDefaultDeposit', 5000],   // 联营默认保证金
+    ['merchantContractPeriods', 30],    // 默认签约周期（游戏日）
+    ['merchantAutoSettle', 1]           // 日结自动生成联营结算单
   ]) {
     if (!getSetting(k)) setSetting(k, String(v))
   }

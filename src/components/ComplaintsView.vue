@@ -95,9 +95,20 @@ const manualMsg = ref('')
 const targetOptions = computed(() => {
   if (manual.value.target_type === 'ride') return store.rides
   if (manual.value.target_type === 'vendor') return store.vendors
+  if (manual.value.target_type === 'merchant') return store.merchants.filter(m => ['operating', 'suspended'].includes(m.status))
   if (manual.value.target_type === 'zone') return store.zones
   return []
 })
+
+// 联营商户投诉违约扣款（随商户下一结算单扣减分成）
+async function merchantFine(c) {
+  const amount = prompt(`对联营商户「${c.target_name}」登记违约扣款金额（元，随下一结算单扣商户分成）：`, '200')
+  if (amount === null || !(Number(amount) > 0)) return
+  const note = prompt('扣款事由：', c.title || '投诉违约')
+  if (note === null) return
+  const r = await store.complaintMerchantFine(c.id, { amount: Number(amount), note })
+  if (!r?.ok) alert(r?.msg || '登记失败')
+}
 async function submitManual() {
   if (!manual.value.content.trim()) { manualMsg.value = '请填写游客反馈内容'; return }
   const r = await store.fileComplaint({ ...manual.value, target_id: manual.value.target_id || undefined })
@@ -206,6 +217,7 @@ const womText = computed(() => `${wom.value > 0 ? '+' : ''}${wom.value.toFixed(1
                 <button v-if="c.status === 'open'" class="succ" :disabled="!assignees[c.id]" @click="assign(c)">受理</button>
                 <button v-if="c.status === 'ready'" class="succ" @click="resolveC(c)">确认补偿结案</button>
                 <button v-if="c.category === 'safety' && c.status !== 'closed_resolved' && c.status !== 'closed_timeout'" class="ghost" @click="toEmergency(c)">🚨 转报应急</button>
+                <button v-if="c.target_type === 'merchant' && c.status !== 'closed_timeout'" class="ghost" @click="merchantFine(c)">🤝 联营违约扣款</button>
                 <button v-if="c.severity < 3" class="ghost" @click="escalate(c)">⬆ 升级{{ c.escalated ? `（${c.escalations}次）` : '' }}</button>
                 <button class="danger" @click="forceClose(c)">不予补偿结案</button>
               </div>
@@ -238,6 +250,7 @@ const womText = computed(() => `${wom.value > 0 ? '+' : ''}${wom.value.toFixed(1
                 <option value="">不指定</option>
                 <option value="ride">游乐设施</option>
                 <option value="vendor">商铺</option>
+                <option value="merchant">联营商户</option>
                 <option value="zone">区域</option>
               </select>
             </label>

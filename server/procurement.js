@@ -288,6 +288,105 @@ export function reserveVendorStock(vendorId, qty) {
   return { ok: true, managed: true, sold: want }
 }
 
+// ---------------- 联营商户：复用 FEFO 批次库存体系 ----------------
+// 联营商户独立绑定经营物资（merchant_materials），销售同样按 FEFO 先到期先出消耗；
+// 未配置物资的联营商户不受库存约束。库存流水以 ref_type='merchant' 标记归属。
+export function merchantMaterialIds(merchantId) {
+  return db.prepare('SELECT material_id FROM merchant_materials WHERE merchant_id=? ORDER BY material_id').all(merchantId).map(x => x.material_id)
+}
+export function setMerchantMaterials(merchantId, materialIds) {
+  const ids = [...new Set((materialIds || []).map(num).filter(Boolean))]
+  return tx(() => {
+    db.prepare('DELETE FROM merchant_materials WHERE merchant_id=?').run(merchantId)
+    const ins = db.prepare('INSERT OR IGNORE INTO merchant_materials(merchant_id,material_id) VALUES(?,?)')
+    for (const mid of ids) {
+      if (!getMaterial(mid)) throw new ProcError('BAD_ARG', `物资 #${mid} 不存在`)
+      ins.run(merchantId, mid)
+    }
+    return { ok: true }
+  })
+}
+export function merchantStockState(merchantId) {
+  const mids = merchantMaterialIds(merchantId)
+  const mats = mids.map(id => listMaterials().find(m => m.id === id)).filter(Boolean)
+  if (!mids.length) return { managed: false, mids: [], status: 'none', saleable: Infinity, mats: [] }
+  const saleableQty = Math.min(...mats.map(m => m.qty_on_hand))
+  const status = mats.some(m => m.stock_status === 'out') ? 'out' : mats.some(m => m.stock_status === 'low') ? 'low' : 'ok'
+  return { managed: true, mids, status, saleable: Math.floor(saleableQty * 10) / 10, mats }
+}
+// 联营商户可售量：未挂物资=不受限；否则取各物资可用量最小值
+export function merchantSaleableQty(merchantId, want) {
+  const st = merchantStockState(merchantId)
+  if (!st.managed) return { managed: false, sold: want, lost: 0, mids: [] }
+  const sold = Math.min(want, st.saleable)
+  return { managed: true, sold: round1(Math.floor(sold * 10) / 10), lost: round1(want - Math.floor(sold * 10) / 10), mids: st.mids }
+}
+
+// 联营商户销售扣库存（必须在调用方业务事务内执行：整单量可满足才扣，否则抛 STOCKOUT）
+export function deductMerchantStock(merchantId, qty) {
+  const want = Math.max(1, Math.round(num(qty)))
+  const st = merchantStockState(merchantId)
+  if (!st.managed) return { managed: false, mids: [] }
+  if (st.saleable + 0.0001 < want) {
+    const m = st.mats.find(x => x.qty_on_hand < want)
+    throw new ProcError('STOCKOUT', `联营商品「${m?.name || '物资'}」库存仅剩 ${m?.qty_on_hand ?? 0} ${m?.unit || '份'}，本单需 ${want}`)
+  }
+  for (const mid of st.mids) {
+    deductStock(mid, want, { reason: 'sale', refType: 'merchant', refId: merchantId })
+  }
+  return { managed: true, mids: st.mids }
+}
+
+// 联营商户散客批量销售：按可售量截断，缺货部分记流失（vendor_id=0 + merchant_id 标记）
+export function applyMerchantSales(merchantId, wantQty) {
+  const want = Math.max(0, round1(num(wantQty)))
+  const cap = merchantSaleableQty(merchantId, want)
+  return tx(() => {
+    if (!cap.managed) return cap
+    if (cap.sold > 0) {
+      for (const mid of cap.mids) {
+        deductStock(mid, cap.sold, { reason: 'sale', refType: 'merchant', refId: merchantId })
+      }
+    }
+    if (cap.lost > 0) {
+      const m = db.prepare('SELECT name,price FROM merchants WHERE id=?').get(merchantId)
+      const lostRev = Math.round(cap.lost * (m?.price || 0))
+      for (const mid of cap.mids) {
+        const last = db.prepare(`SELECT * FROM stock_lost_sales WHERE merchant_id=? AND IFNULL(material_id,-1)=? AND day=? AND tick=?
+                                 ORDER BY id DESC LIMIT 1`).get(merchantId, mid, ctx.day(), ctx.tick())
+        if (last) {
+          db.prepare('UPDATE stock_lost_sales SET qty_lost=?, lost_rev=? WHERE id=?')
+            .run(round1(last.qty_lost + cap.lost), last.lost_rev + lostRev, last.id)
+        } else {
+          db.prepare('INSERT INTO stock_lost_sales(vendor_id,merchant_id,material_id,qty_lost,lost_rev,day,tick) VALUES(0,?,?,?,?,?,?)')
+            .run(merchantId, mid, cap.lost, lostRev, ctx.day(), ctx.tick())
+        }
+      }
+    }
+    return cap
+  })
+}
+
+// 联营商户退货回补库存（必须在调用方业务事务内执行）：回最近在库批次，无批次则建退货回补批
+export function returnMerchantStock(merchantId, qty) {
+  const q = Math.max(1, Math.round(num(qty)))
+  const mids = merchantMaterialIds(merchantId)
+  for (const mid of mids) {
+    const m = getMaterial(mid)
+    const batch = db.prepare(`SELECT * FROM inbound_batches WHERE material_id=? AND status='in' ORDER BY id DESC LIMIT 1`).get(mid)
+    if (batch) {
+      const left = round1(Math.min(batch.qty_received, batch.qty_remain + q))
+      db.prepare("UPDATE inbound_batches SET qty_remain=?, status='in' WHERE id=?").run(left, batch.id)
+      const after = round1(onHand(mid) + q)
+      setOnHand(mid, after)
+      logMovement(mid, batch.id, null, q, after, 'sale_return', 'merchant', merchantId)
+    } else {
+      receiveIntoStock(mid, q, m.std_cost, { reason: 'sale_return', note: `联营商户#${merchantId}销售退货回补（无在库批次）` })
+    }
+  }
+  return { managed: mids.length > 0 }
+}
+
 function recordLostSale(vendorId, mids, qtyLost) {
   const v = db.prepare('SELECT * FROM vendors WHERE id=?').get(vendorId)
   const lostRev = Math.round(qtyLost * (v?.price || 0) * (v?.margin || 0.6))

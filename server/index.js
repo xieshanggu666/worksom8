@@ -62,6 +62,13 @@ import {
   createStocktake, submitStocktake, approveStocktake, cancelStocktake, listStocktakes, stocktakeDetail,
   listInventoryFindings, resolveInventoryFinding, ignoreInventoryFinding, procurementStats
 } from './procurement.js'
+import {
+  initMerchantContext, applyMerchant, approveMerchant, rejectMerchant,
+  setMerchantSuspended, saveMerchantMaterials, recordMerchantSale, refundMerchantSale,
+  fineMerchant, generateSettlement, confirmSettlement, paySettlement, terminateMerchant,
+  listMerchants, merchantDetail, listSales as listMerchantSales, listSettlements as listMerchantSettlements,
+  merchantStats, merchantConfig as getMerchantConfig, dayCloseMerchants, merchantTick
+} from './merchants.js'
 
 const app = express()
 app.use(express.json())
@@ -141,6 +148,11 @@ initMemberContext({
 })
 // 物资采购与库存：财务流水（采购付款/退货/报损/盘亏）
 initProcurementContext({ logFinance })
+// 园区联营商户：财务流水 + 投诉建单（联营服务/餐饮/价格投诉挂商户目标）
+initMerchantContext({
+  logFinance,
+  createComplaint: (payload) => createComplaint(payload)
+})
 // 设施域服务：时钟 / 现金 / 财务流水（升级扣款与流水同事务原子提交）
 initRideContext({ logFinance })
 // 预约 ↔ 会员双向联动：预约侧注入会员报价/下单/退款回调；会员侧绑定会员模拟下单入口
@@ -345,6 +357,15 @@ function pickComplaintTarget(cat, rides, vendors, zones) {
     const pool = cat === 'food' ? inPark.filter(v => v.type !== '纪念品') : inPark
     const v = pick(pool.length ? pool : inPark)
     return v ? { type: 'vendor', id: v.id, name: v.name } : none
+  }
+  if (cat === 'service') {
+    // 服务态度类投诉可能落在营业中的联营商户
+    const mers = db.prepare("SELECT id,name FROM merchants WHERE status='operating'").all()
+    if (mers.length && Math.random() < 0.4) {
+      const m = pick(mers)
+      return { type: 'merchant', id: m.id, name: m.name }
+    }
+    return none
   }
   return none
 }
@@ -579,12 +600,14 @@ function linkComplaintsToRide(rideId, staffId) {
 function enrichComplaints(rows) {
   const tick = state.tick()
   const rides = allRides(), vendors = allVendors(), zones = allZones()
+  const merchants = db.prepare('SELECT id,name,status FROM merchants').all()
   const memberRows = db.prepare('SELECT id,code,name,card_tier FROM members').all()
   const memberMap = new Map(memberRows.map(m => [m.id, m]))
   return rows.map(c => {
     const st = c.assignee_id ? db.prepare('SELECT id,name,role,skill,morale FROM staff WHERE id=?').get(c.assignee_id) : null
     const target = c.target_type === 'ride' ? rides.find(r => r.id === c.target_id)
       : c.target_type === 'vendor' ? vendors.find(v => v.id === c.target_id)
+      : c.target_type === 'merchant' ? merchants.find(x => x.id === c.target_id)
       : c.target_type === 'zone' ? zones.find(z => z.id === c.target_id) : null
     const meta = COMPLAINT_CATS[c.category] || COMPLAINT_CATS.service
     const active = ['open', 'processing'].includes(c.status)
@@ -662,6 +685,20 @@ function tick() {
         .run(state.tick(), day, 'member', '会员卡集中到期',
           `日结扫描发现 ${expiredCards} 张会员卡已过有效期，已自动降级为普通会员（积分与储值余额保留）。会员专员可跟进续费转化。`, 0, 'resolved')
     }
+    // 联营商户日结：合同到期自动暂停营业；按配置自动生成截至昨日的分账结算单（待运营确认付款）
+    try {
+      const mc = dayCloseMerchants(day + 1)
+      if (mc.expired.length) {
+        db.prepare('INSERT INTO events(tick,day,type,title,desc,impact,status) VALUES(?,?,?,?,?,?,?)')
+          .run(state.tick(), day, 'merchant', '联营商户合同到期',
+            `${mc.expired.length} 家联营商户合同到期已自动暂停营业，请在「联营结算」页办理续约或解约清算。`, -1, 'active')
+      }
+      if (mc.bills.length) {
+        db.prepare('INSERT INTO events(tick,day,type,title,desc,impact,status) VALUES(?,?,?,?,?,?,?)')
+          .run(state.tick(), day, 'merchant', '联营商户日结账单已生成',
+            `日结自动生成 ${mc.bills.length} 张联营分账结算单，等待运营确认并付款给商户。`, 0, 'active')
+      }
+    } catch (e) { console.error('[merchants] 联营日结失败:', e) }
     day += 1
     setSetting('day', day)
     // 统一客流闭环：新一天首个 tick 对「刚结束的一天」回填实际客流、计算预测命中率并学习散客外推系数。
@@ -787,6 +824,13 @@ function tick() {
   }
   if (vendorIncome > 0) logFinance(day, '商业', vendorIncome, '商铺营收')
 
+  // 联营商户营收：园区统一收银逐笔流水（FEFO 联动库存消耗、会员/散客由引擎按客流产生），
+  // 按抽成比例拆分园方佣金/商户应分（商户分成暂挂园区，结算单付款时才流出）
+  try {
+    const mr = merchantTick({ entering, satisfaction })
+    // 引擎 tick 末会以本地 cash 回写，联营流水净额并入本地现金，避免被覆盖
+    cash += (mr.amount || 0) - (mr.refundAmount || 0)
+  } catch (e) { console.error('[merchants] 联营商户模拟推进失败（不影响主循环）:', e) }
   // 需求侧：模拟游客为未来三天的入园/设施时段下单预约（预收款即入账）
   autoBookDemand(allRides(), base, priceFactor, repFactor * complaintFactor)
 
@@ -1056,6 +1100,12 @@ app.get('/api/state', (req, res) => {
     stockBatches: listBatches({ expiring: true, limit: 50 }),
     stocktakes: listStocktakes({ limit: 30 }),
     purchaseReturns: listReturns({ limit: 50 }),
+    // 园区联营商户结算
+    merchants: listMerchants(),
+    merchantStats: merchantStats(),
+    merchantConfig: getMerchantConfig(),
+    merchantSettlements: listMerchantSettlements({ limit: 80 }),
+    merchantSales: listMerchantSales({ limit: 60 }),
     avgs: {
       satisfaction: computeSatisfaction(),
       openRatio: rides.length ? operatingRides().length / rides.length : 0
@@ -1424,6 +1474,7 @@ app.post('/api/complaints', (req, res) => {
   let target = { type: '', id: null, name: '' }
   if (b.target_type === 'ride') { const r = allRides().find(x => x.id === num(b.target_id)); if (r) target = { type: 'ride', id: r.id, name: r.name } }
   else if (b.target_type === 'vendor') { const v = allVendors().find(x => x.id === num(b.target_id)); if (v) target = { type: 'vendor', id: v.id, name: v.name } }
+  else if (b.target_type === 'merchant') { const mr = db.prepare('SELECT id,name FROM merchants WHERE id=?').get(num(b.target_id)); if (mr) target = { type: 'merchant', id: mr.id, name: mr.name } }
   else if (b.target_type === 'zone') { const z = allZones().find(x => x.id === num(b.target_id)); if (z) target = { type: 'zone', id: z.id, name: z.name } }
   // 会员本人投诉（可积分补偿结案）：校验会员档案
   let memberId = null
@@ -1477,6 +1528,26 @@ app.post('/api/complaints/:id/resolve', (req, res) => {
 // 不予补偿直接结案：游客不满，扣减声誉与口碑
 app.post('/api/complaints/:id/close', (req, res) => {
   res.json(forceCloseComplaint(num(req.params.id)))
+})
+
+// 联营商户投诉违约扣款：投诉指向联营商户时，按联营合同登记违约扣款（随下一结算单扣商户分成）
+app.post('/api/complaints/:id/merchant-fine', (req, res) => {
+  const b = req.body || {}
+  const id = num(req.params.id)
+  const c = db.prepare('SELECT * FROM complaints WHERE id=?').get(id)
+  if (!c) return res.status(404).json({ ok: false, msg: '投诉不存在' })
+  if (c.target_type !== 'merchant' || !c.target_id) {
+    return res.status(400).json({ ok: false, code: 'TARGET_MISMATCH', msg: '该投诉未指向联营商户，无法登记联营违约扣款' })
+  }
+  const amount = Math.round(num(b.amount))
+  if (!(amount > 0)) return res.status(400).json({ ok: false, msg: '扣款金额须大于 0' })
+  const r = fineMerchant(c.target_id, amount, {
+    complaintId: id,
+    note: String(b.note || `投诉 ${c.code} 违约扣款`),
+    staffId: num(b.staff_id) || null
+  })
+  if (r.ok) logComplaint(id, 'resolve', `按联营合同登记商户违约扣款 ¥${amount}（随结算单扣减）`, num(b.staff_id) || null)
+  reply(req, res, r)
 })
 
 // 单条投诉详情 + 处理时间线
@@ -2240,6 +2311,134 @@ app.post('/api/incident-claims/:id/reject', (req, res) => {
     handlerId: b.handler_id ? num(b.handler_id) : null,
     requestId: idemKey(req)
   }))
+})
+
+// ---------------- 园区联营商户结算：申请入驻 / 审核签约 / 分账 / 结算 ----------------
+app.get('/api/merchants', (req, res) => {
+  const q = req.query || {}
+  res.json({
+    list: listMerchants({ status: q.status && q.status !== 'all' ? q.status : null }),
+    stats: merchantStats(),
+    config: getMerchantConfig()
+  })
+})
+app.get('/api/merchants/:id', (req, res) => {
+  const d = merchantDetail(num(req.params.id))
+  if (!d) return res.status(404).json({ ok: false, msg: '商户不存在' })
+  res.json(d)
+})
+
+// 商户提交入驻申请（幂等）
+app.post('/api/merchants', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, applyMerchant({
+    name: String(b.name || ''),
+    contact: String(b.contact || ''),
+    phone: String(b.phone || ''),
+    category: String(b.category || '餐饮'),
+    zone_id: num(b.zone_id, 1),
+    price: num(b.price, 25),
+    commission_rate: b.commission_rate !== undefined ? num(b.commission_rate) : undefined,
+    deposit: b.deposit !== undefined ? num(b.deposit) : undefined,
+    contract_periods: b.contract_periods !== undefined ? num(b.contract_periods) : undefined,
+    apply_note: String(b.apply_note || ''),
+    requestId: idemKey(req)
+  }), 201)
+})
+
+// 运营审核通过并签约（可微调抽成/保证金/周期；签约即收保证金，幂等）
+app.post('/api/merchants/:id/approve', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, approveMerchant(num(req.params.id), {
+    staffId: num(b.staff_id) || null,
+    commissionRate: b.commission_rate !== undefined ? num(b.commission_rate) : null,
+    deposit: b.deposit !== undefined ? num(b.deposit) : null,
+    periods: b.contract_periods !== undefined ? num(b.contract_periods) : null,
+    requestId: idemKey(req)
+  }))
+})
+app.post('/api/merchants/:id/reject', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, rejectMerchant(num(req.params.id), { reason: String(b.reason || ''), staffId: num(b.staff_id) || null }))
+})
+app.post('/api/merchants/:id/suspend', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, setMerchantSuspended(num(req.params.id), true, { reason: String(b.reason || ''), staffId: num(b.staff_id) || null }))
+})
+app.post('/api/merchants/:id/resume', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, setMerchantSuspended(num(req.params.id), false, { staffId: num(b.staff_id) || null }))
+})
+// 解约清算（结清全部账后退保证金，幂等）
+app.post('/api/merchants/:id/terminate', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, terminateMerchant(num(req.params.id), { staffId: num(b.staff_id) || null, reason: String(b.reason || '') }))
+})
+// 配置联营商户经营物资（联动 FEFO 库存）
+app.post('/api/merchants/:id/materials', (req, res) => {
+  reply(req, res, saveMerchantMaterials(num(req.params.id), req.body?.material_ids || []))
+})
+
+// 联营收银（散客/会员，幂等）：会员享卡折扣、赚积分，整单 FEFO 扣库存
+app.post('/api/merchants/:id/sales', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, recordMerchantSale(num(req.params.id), num(b.qty, 1), {
+    source: b.source === 'manual' ? 'guest' : 'guest',
+    memberId: b.member_id ? num(b.member_id) : null,
+    note: String(b.note || ''),
+    requestId: idemKey(req)
+  }), 201)
+})
+// 联营退货退款（未结算红冲/已结算结转下期，库存回补，积分回退，幂等）
+app.post('/api/merchants/:id/refunds', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, refundMerchantSale(num(req.params.id), {
+    saleId: b.sale_id ? num(b.sale_id) : null,
+    qty: num(b.qty, 1),
+    reason: String(b.reason || ''),
+    requestId: idemKey(req)
+  }), 201)
+})
+// 投诉违约扣款（投诉处理联动，随下一结算单扣商户分成）
+app.post('/api/merchants/:id/fines', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, fineMerchant(num(req.params.id), num(b.amount), {
+    complaintId: b.complaint_id ? num(b.complaint_id) : null,
+    note: String(b.note || ''),
+    staffId: num(b.staff_id) || null
+  }), 201)
+})
+// 联营结算单列表 / 生成 / 确认 / 付款
+app.get('/api/merchant-settlements', (req, res) => {
+  const q = req.query || {}
+  res.json({ list: listMerchantSettlements({ status: q.status && q.status !== 'all' ? q.status : null }) })
+})
+app.post('/api/merchants/:id/settlements', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, generateSettlement(num(req.params.id), {
+    dayTo: b.day_to !== undefined ? num(b.day_to) : null,
+    creatorId: num(b.staff_id) || null,
+    note: String(b.note || '')
+  }), 201)
+})
+app.post('/api/merchant-settlements/:id/confirm', (req, res) => {
+  reply(req, res, confirmSettlement(num(req.params.id), { staffId: num(req.body?.staff_id) || null }))
+})
+app.post('/api/merchant-settlements/:id/pay', (req, res) => {
+  reply(req, res, paySettlement(num(req.params.id), {
+    staffId: num(req.body?.staff_id) || null,
+    requestId: idemKey(req)
+  }))
+})
+// 联营模块运营配置：默认抽成 / 保证金 / 签约周期 / 日结自动出账 / 模块开关
+app.post('/api/merchant-config', (req, res) => {
+  const b = req.body || {}
+  if (b.default_commission !== undefined) setSetting('merchantDefaultCommission', Math.max(0.05, Math.min(0.8, num(b.default_commission))))
+  if (b.default_deposit !== undefined) setSetting('merchantDefaultDeposit', Math.max(0, Math.round(num(b.default_deposit))))
+  if (b.contract_periods !== undefined) setSetting('merchantContractPeriods', Math.max(1, Math.round(num(b.contract_periods))))
+  if (b.auto_settle !== undefined) setSetting('merchantAutoSettle', b.auto_settle ? 1 : 0)
+  if (b.enabled !== undefined) setSetting('merchantEnabled', b.enabled ? 1 : 0)
+  res.json({ ok: true, config: getMerchantConfig() })
 })
 
 // 全局异常兜底：未捕获错误统一返回可追踪的 500（请求号写入服务端日志）

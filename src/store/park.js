@@ -72,6 +72,14 @@ function emptyProcurementStats() {
   }
 }
 
+function emptyMerchantStats() {
+  return {
+    applied: 0, operating: 0, suspended: 0, terminated: 0,
+    totalSalesAmount: 0, totalCommission: 0, totalSettled: 0, totalFine: 0, depositHeld: 0,
+    payableBills: { a: 0, n: 0 }, todaySalesAmount: 0, todaySalesQty: 0, todayCommission: 0, todayRefund: 0
+  }
+}
+
 export const useParkStore = defineStore('park', {
   state: () => ({
     data: null,
@@ -139,7 +147,13 @@ export const useParkStore = defineStore('park', {
     inventoryFindings: s => s.data?.inventoryFindings || [],
     stockBatches: s => s.data?.stockBatches || [],
     stocktakes: s => s.data?.stocktakes || [],
-    purchaseReturns: s => s.data?.purchaseReturns || []
+    purchaseReturns: s => s.data?.purchaseReturns || [],
+    // 园区联营商户结算
+    merchants: s => s.data?.merchants || [],
+    merchantStats: s => s.data?.merchantStats || emptyMerchantStats(),
+    merchantConfig: s => s.data?.merchantConfig || { enabled: 1, defaultCommission: 0.2, defaultDeposit: 5000, contractPeriods: 30, autoSettle: 1 },
+    merchantSettlements: s => s.data?.merchantSettlements || [],
+    merchantSales: s => s.data?.merchantSales || []
   },
   actions: {
     async refresh() {
@@ -283,6 +297,23 @@ export const useParkStore = defineStore('park', {
     async stocktakeDetail(id) { return j('GET', `/stocktakes/${id}`) },
     async inventoryFindings(query = '') { return j('GET', `/inventory-findings${query}`) },
     resolveInventoryFinding(id, note) { return this.api('POST', `/inventory-findings/${id}/resolve`, { note }) },
-    ignoreInventoryFinding(id, note) { return this.api('POST', `/inventory-findings/${id}/ignore`, { note }) }
+    ignoreInventoryFinding(id, note) { return this.api('POST', `/inventory-findings/${id}/ignore`, { note }) },
+    // 园区联营商户结算
+    applyMerchant(payload) { return this.api('POST', '/merchants', payload) },
+    approveMerchant(id, payload) { return this.api('POST', `/merchants/${id}/approve`, payload) },
+    rejectMerchant(id, payload) { return this.api('POST', `/merchants/${id}/reject`, payload) },
+    suspendMerchant(id, payload) { return this.api('POST', `/merchants/${id}/suspend`, payload || {}) },
+    resumeMerchant(id) { return this.api('POST', `/merchants/${id}/resume`, {}) },
+    terminateMerchant(id, payload) { return this.api('POST', `/merchants/${id}/terminate`, payload || {}) },
+    setMerchantMaterials(id, material_ids) { return this.api('POST', `/merchants/${id}/materials`, { material_ids }) },
+    merchantSale(id, payload) { return this.api('POST', `/merchants/${id}/sales`, payload) },
+    merchantRefund(id, payload) { return this.api('POST', `/merchants/${id}/refunds`, payload) },
+    merchantFine(id, payload) { return this.api('POST', `/merchants/${id}/fines`, payload) },
+    createMerchantSettlement(id, payload) { return this.api('POST', `/merchants/${id}/settlements`, payload || {}) },
+    confirmMerchantSettlement(id) { return this.api('POST', `/merchant-settlements/${id}/confirm`, {}) },
+    payMerchantSettlement(id, request_id) { return this.api('POST', `/merchant-settlements/${id}/pay`, { request_id }) },
+    saveMerchantConfig(payload) { return this.api('POST', '/merchant-config', payload) },
+    complaintMerchantFine(id, payload) { return this.api('POST', `/complaints/${id}/merchant-fine`, payload) },
+    async merchantDetail(id) { return j('GET', `/merchants/${id}`) }
   }
 })
