@@ -58,7 +58,10 @@ const ctx = {
   hour: () => num(getSetting('hour'), 9),
   tick: () => num(getSetting('tick'), 0),
   cash: () => num(getSetting('cash'), 0),
-  logFinance: null
+  logFinance: null,
+  reserveVendorStock: null,
+  // 联营分账钩子（仅联营商铺注入）：成交后按合同拆账写 partner_sales，与扣款/库存同事务
+  partnerSaleHook: null
 }
 export function initMemberContext(deps) { Object.assign(ctx, deps) }
 
@@ -316,16 +319,30 @@ export function vendorSpend(memberId, vendorId, { payMethod = 'cash', benefitId 
     // 商铺确认收入：现金部分；储值部分为负债转收入（不产生新现金）
     const recognized = cashPart + balancePart
     db.prepare('UPDATE vendors SET sold=sold+?, rev=rev+? WHERE id=?').run(q, recognized, vendorId)
-    if (cashPart > 0) ctx.logFinance?.(ctx.day(), '商业', cashPart, `${m.code} 会员在「${vendor.name}」现金消费`)
-    if (balancePart > 0) ctx.logFinance?.(ctx.day(), '商业', balancePart, `${m.code} 会员在「${vendor.name}」储值消费（负债转收入）`)
-    if (voucherPart > 0) ctx.logFinance?.(ctx.day(), '会员权益', -voucherPart, `${m.code} 核销消费券（营销成本）·「${vendor.name}」`)
+    // 联营分账：会员在联营商铺成交 → 按合同扣点与会员优惠分摊写流水（与扣款/库存同事务，失败整体回滚）
+    const partner = ctx.partnerSaleHook
+      ? ctx.partnerSaleHook(vendorId, { qty: q, gross, bill, memberId })
+      : null
+    if (partner) {
+      // 联营口径：现金为园方代收（商业收入），商户分账在结算账单支付时清偿；
+      // 储值部分原是对会员负债，转为对商户的应付（不产生现金，记联营分成转出）
+      if (cashPart > 0) ctx.logFinance?.(ctx.day(), '商业', cashPart, `${m.code} 会员在联营「${vendor.name}」现金消费（代收）`)
+      if (balancePart > 0) {
+        ctx.logFinance?.(ctx.day(), '商业', balancePart, `${m.code} 会员在联营「${vendor.name}」储值消费（代收，负债转商户应付）`)
+      }
+      if (voucherPart > 0) ctx.logFinance?.(ctx.day(), '会员权益', -voucherPart, `${m.code} 核销消费券（营销成本园方承担）·联营「${vendor.name}」`)
+    } else {
+      if (cashPart > 0) ctx.logFinance?.(ctx.day(), '商业', cashPart, `${m.code} 会员在「${vendor.name}」现金消费`)
+      if (balancePart > 0) ctx.logFinance?.(ctx.day(), '商业', balancePart, `${m.code} 会员在「${vendor.name}」储值消费（负债转收入）`)
+      if (voucherPart > 0) ctx.logFinance?.(ctx.day(), '会员权益', -voucherPart, `${m.code} 核销消费券（营销成本）·「${vendor.name}」`)
+    }
 
     const pts = calcPoints(recognized, tier.point_mul)
     if (pts) addPoints(memberId, pts, 'vendor', 'vendor', vendorId, `「${vendor.name}」消费 ¥${recognized}（${voucherPart ? '券抵 ¥' + voucherPart : ''}）`)
     logMember(memberId, 'vendor',
       `「${vendor.name}」消费 ${q} 份：${cashPart ? `现金 ¥${cashPart} ` : ''}${balancePart ? `储值 ¥${balancePart} ` : ''}${voucherPart ? `消费券抵 ¥${voucherPart}` : ''}，获 ${pts} 积分`)
     touchMember(memberId)
-    return { ok: true, bill, cashPart, balancePart, voucherPart, points: pts }
+    return { ok: true, bill, cashPart, balancePart, voucherPart, points: pts, partner: partner ? { merchantShare: partner.merchantShare, parkShare: partner.parkShare, saleId: partner.saleId } : null }
   })
 }
 

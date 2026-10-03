@@ -139,7 +139,14 @@ export const useParkStore = defineStore('park', {
     inventoryFindings: s => s.data?.inventoryFindings || [],
     stockBatches: s => s.data?.stockBatches || [],
     stocktakes: s => s.data?.stocktakes || [],
-    purchaseReturns: s => s.data?.purchaseReturns || []
+    purchaseReturns: s => s.data?.purchaseReturns || [],
+    // 园区联营商户结算
+    partnerStats: s => s.data?.partnerStats || { contracts: { active: 0, terminated: 0 }, applications: { applied: 0 }, bills: { draft: 0, overdue: 0, payable: 0, paidToday: 0, paidTotal: 0 }, today: { bill: 0, refund: 0, parkShare: 0, merchantShare: 0, fines: 0 } },
+    partnerApplications: s => s.data?.partnerApplications || [],
+    partnerContracts: s => s.data?.partnerContracts || [],
+    partnerSales: s => s.data?.partnerSales || [],
+    partnerSettlements: s => s.data?.partnerSettlements || [],
+    partnerConst: s => s.data?.partnerConst || { periodChoices: [3, 7, 15, 30] }
   },
   actions: {
     async refresh() {
@@ -283,6 +290,19 @@ export const useParkStore = defineStore('park', {
     async stocktakeDetail(id) { return j('GET', `/stocktakes/${id}`) },
     async inventoryFindings(query = '') { return j('GET', `/inventory-findings${query}`) },
     resolveInventoryFinding(id, note) { return this.api('POST', `/inventory-findings/${id}/resolve`, { note }) },
-    ignoreInventoryFinding(id, note) { return this.api('POST', `/inventory-findings/${id}/ignore`, { note }) }
+    ignoreInventoryFinding(id, note) { return this.api('POST', `/inventory-findings/${id}/ignore`, { note }) },
+    // 园区联营商户结算
+    applyPartner(payload) { return this.api('POST', '/partner/applications', payload) },
+    withdrawPartnerApplication(id, staff_id) { return this.api('POST', `/partner/applications/${id}/withdraw`, { staff_id }) },
+    approvePartnerApplication(id, payload) { return this.api('POST', `/partner/applications/${id}/approve`, payload) },
+    rejectPartnerApplication(id, payload) { return this.api('POST', `/partner/applications/${id}/reject`, payload) },
+    terminatePartnerContract(id, payload) { return this.api('POST', `/partner/contracts/${id}/terminate`, payload) },
+    issuePartnerSettlement(id, payload) { return this.api('POST', `/partner/contracts/${id}/settle`, payload || {}) },
+    payPartnerSettlement(id, staff_id) { return this.api('POST', `/partner/settlements/${id}/pay`, { staff_id }) },
+    partnerSalesReturn(saleId, payload) { return this.api('POST', `/partner/sales/${saleId}/return`, payload) },
+    async partnerApplicationDetail(id) { return j('GET', `/partner/applications/${id}`) },
+    async partnerContractDetail(id) { return j('GET', `/partner/contracts/${id}`) },
+    async partnerSettlementDetail(id) { return j('GET', `/partner/settlements/${id}`) },
+    async partnerSalesList(query = '') { return j('GET', `/partner/sales${query}`) }
   }
 })

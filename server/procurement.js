@@ -13,7 +13,9 @@ const ctx = {
   hour: () => num(getSetting('hour'), 9),
   tick: () => num(getSetting('tick'), 0),
   cash: () => num(getSetting('cash'), 0),
-  logFinance: null
+  logFinance: null,
+  // 联营联动：联营商户销售/退货的库存批次成本回调（扣库存在采购事务内，回调不得再开写事务）
+  partnerStockHook: null
 }
 export function initProcurementContext(deps) {
   Object.assign(ctx, deps)
@@ -70,12 +72,13 @@ function availableQty(materialId) {
 
 // FEFO 扣减库存：逐批次扣到 0 再切下一批；调用方需先确认可用量充足
 // includeExpiring=true 时允许核减已过期批次（盘亏/报损场景），销售扣减只走未过期批次
-function deductStock(materialId, qty, { vendorId = null, reason = 'sale', refType = '', refId = 0, includeExpired = false } = {}) {
+// partner 标记联营商户销售扣减：流水记 partner_sale 以便结算时按 FEFO 批次成本汇总扣收
+function deductStock(materialId, qty, { vendorId = null, reason = 'sale', refType = '', refId = 0, includeExpired = false, partner = false } = {}) {
   let remain = qty
   const cuts = []
   const batches = includeExpired
     ? db.prepare(`SELECT * FROM inbound_batches WHERE material_id=? AND status='in' AND qty_remain>0
-                  ORDER BY CASE WHEN expire_day=0 THEN 1 ELSE 0 END, expire_day, id`).all(materialId)
+                  ORDER BY CASE WHEN expire_day=0 THEN 1 ELSE 0 END, expire_day,id`).all(materialId)
     : saleableBatches(materialId)
   for (const b of batches) {
     if (remain <= 0) break
@@ -84,12 +87,16 @@ function deductStock(materialId, qty, { vendorId = null, reason = 'sale', refTyp
     db.prepare('UPDATE inbound_batches SET qty_remain=?, status=? WHERE id=?')
       .run(left, left <= 0 ? 'exhausted' : 'in', b.id)
     remain = round1(remain - take)
-    cuts.push({ batchId: b.id, take })
+    cuts.push({ batchId: b.id, take, unitCost: b.unit_cost })
   }
   if (remain > 0.0001) throw new ProcError('STOCK_INSUFFICIENT', `库存扣减失败：物资#${materialId} 可用量不足`)
   const after = round1(onHand(materialId) - qty)
   setOnHand(materialId, after)
-  for (const c of cuts) logMovement(materialId, c.batchId, vendorId, -c.take, after, reason, refType, refId)
+  const useReason = partner && reason === 'sale' ? 'partner_sale' : reason
+  for (const c of cuts) {
+    logMovement(materialId, c.batchId, vendorId, -c.take, after, useReason, refType, refId)
+    if (partner) ctx.partnerStockHook?.(vendorId, { kind: 'sale', materialId, batchId: c.batchId, qty: c.take, unitCost: c.unitCost })
+  }
   return cuts
 }
 
@@ -257,7 +264,7 @@ export function vendorSaleable(vendorId, want) {
   return { managed: true, sold: round1(sold), lost: round1(want - sold), mids }
 }
 
-export function applyVendorSales(vendorId, wantQty) {
+export function applyVendorSales(vendorId, wantQty, { partner = false } = {}) {
   const want = Math.max(0, round1(num(wantQty)))
   const cap = vendorSaleable(vendorId, want)
   return tx(() => {
@@ -265,7 +272,7 @@ export function applyVendorSales(vendorId, wantQty) {
     // 有可售量才扣批次；完全断货时 sold=0 也要继续累计流失（持续断货每时段都在损失营收）
     if (cap.sold > 0) {
       for (const mid of cap.mids) {
-        deductStock(mid, cap.sold, { vendorId, reason: 'sale', refType: 'vendor', refId: vendorId })
+        deductStock(mid, cap.sold, { vendorId, reason: 'sale', refType: 'vendor', refId: vendorId, partner })
       }
     }
     if (cap.lost > 0) recordLostSale(vendorId, cap.mids, cap.lost)
@@ -274,7 +281,7 @@ export function applyVendorSales(vendorId, wantQty) {
 }
 
 // 会员消费专用：要求整单数量可满足，否则抛 STOCKOUT（与支付同事务，会员页可提示改数量）
-export function reserveVendorStock(vendorId, qty) {
+export function reserveVendorStock(vendorId, qty, { partner = false } = {}) {
   const want = Math.max(1, Math.round(num(qty)))
   const cap = vendorSaleable(vendorId, want)
   if (!cap.managed) return { ok: true, managed: false, sold: want }
@@ -283,7 +290,7 @@ export function reserveVendorStock(vendorId, qty) {
     throw new ProcError('STOCKOUT', `「${m?.name || '物资'}」库存仅剩 ${availableQty(m?.id)} ${m?.unit || '份'}，本单需 ${want}，请减少数量或等待补货`)
   }
   for (const mid of cap.mids) {
-    deductStock(mid, want, { vendorId, reason: 'sale', refType: 'vendor', refId: vendorId })
+    deductStock(mid, want, { vendorId, reason: 'sale', refType: 'vendor', refId: vendorId, partner })
   }
   return { ok: true, managed: true, sold: want }
 }
@@ -313,25 +320,35 @@ function recordLostSale(vendorId, mids, qtyLost) {
 }
 
 // 游客销售退货：库存回补（回最近一批在库批次；无批次则新建退货回补批），按售价退款
-export function customerReturn(vendorId, qty, { reason = '', memberId = null } = {}) {
+// partner 标记联营商户退货：流水记 partner_sale_return，返回明细供联营模块红冲分账与批次成本
+export function customerReturn(vendorId, qty, { reason = '', memberId = null, partner = false } = {}) {
   const v = db.prepare('SELECT * FROM vendors WHERE id=?').get(vendorId)
   if (!v) return { ok: false, code: 'NOT_FOUND', msg: '商铺不存在' }
   const q = Math.max(1, Math.round(num(qty)))
   const mids = vendorMaterialIds(vendorId)
   try {
-    return tx(() => {
+    const restored = []
+    const r0 = tx(() => {
       for (const mid of mids) {
         const m = getMaterial(mid)
         const batch = db.prepare(`SELECT * FROM inbound_batches WHERE material_id=? AND status='in' ORDER BY id DESC LIMIT 1`).get(mid)
+        let bid, unitCost
         if (batch) {
+          bid = batch.id
+          unitCost = batch.unit_cost
           const left = round1(Math.min(batch.qty_received, batch.qty_remain + q))
           db.prepare("UPDATE inbound_batches SET qty_remain=?, status='in' WHERE id=?").run(left, batch.id)
           const after = round1(onHand(mid) + q)
           setOnHand(mid, after)
-          logMovement(mid, batch.id, vendorId, q, after, 'sale_return', 'return', 0)
+          const useReason = partner ? 'partner_sale_return' : 'sale_return'
+          logMovement(mid, batch.id, vendorId, q, after, useReason, 'return', 0)
         } else {
-          receiveIntoStock(mid, q, m.std_cost, { reason: 'sale_return', note: '销售退货回补（无在库批次）' })
+          unitCost = m.std_cost
+          const newBid = receiveIntoStock(mid, q, m.std_cost, { reason: partner ? 'partner_sale_return' : 'sale_return', note: '销售退货回补（无在库批次）' })
+          bid = newBid
         }
+        restored.push({ materialId: mid, batchId: bid, unitCost })
+        if (partner) ctx.partnerStockHook?.(vendorId, { kind: 'return', materialId: mid, batchId: bid, qty: q, unitCost })
         const rid = db.prepare(`INSERT INTO purchase_returns(kind,vendor_id,material_id,qty,amount,reason,status,create_tick,create_day)
                                 VALUES('sale',?,?,?,? ,?, 'done',?,?)`)
           .run(vendorId, mid, q, Math.round(q * v.price), reason || '游客退货', ctx.tick(), ctx.day())
@@ -342,8 +359,9 @@ export function customerReturn(vendorId, qty, { reason = '', memberId = null } =
       setSetting('cash', Math.round(ctx.cash() - refund))
       ctx.logFinance?.(ctx.day(), '商业', -refund, `「${v.name}」销售退货 ${q} 份退款`)
       logOrder(null, 'sale_return', `「${v.name}」销售退货 ${q} 份，退款 ¥${refund}`)
-      return { ok: true, refund }
+      return { ok: true, refund, restored }
     })
+    return r0
   } catch (e) {
     return { ok: false, code: e.code || 'TX_FAILED', msg: e.message || '退货失败' }
   }
@@ -954,6 +972,19 @@ export function listReturns({ kind = null, limit = 100 } = {}) {
     vendor_name: r.vendor_id ? db.prepare('SELECT name FROM vendors WHERE id=?').get(r.vendor_id)?.name || '' : '',
     order_code: r.order_id ? db.prepare('SELECT code FROM purchase_orders WHERE id=?').get(r.order_id)?.code || '' : ''
   }))
+}
+
+// 联营结算用：按库存流水汇总联营商户在区间内消耗的 FEFO 批次成本
+// 销售扣减（partner_sale）- 退货回补（partner_sale_return），净额即商户应承担的物料成本
+export function partnerCogs(vendorId, dayFrom, dayTo) {
+  const row = db.prepare(`SELECT
+      COALESCE(SUM(CASE WHEN reason='partner_sale' THEN ROUND((-change)*b.unit_cost) ELSE 0 END),0) sold_cost,
+      COALESCE(SUM(CASE WHEN reason='partner_sale_return' THEN ROUND(change*b.unit_cost) ELSE 0 END),0) return_cost
+      FROM stock_movements sm LEFT JOIN inbound_batches b ON b.id=sm.batch_id
+      WHERE sm.vendor_id=? AND sm.reason IN ('partner_sale','partner_sale_return')
+        AND sm.day>=? AND sm.day<=?`).get(vendorId, dayFrom, dayTo)
+  const cogs = Math.max(0, Math.round(num(row.sold_cost) - num(row.return_cost)))
+  return { cogs, soldCost: Math.round(num(row.sold_cost)), returnCost: Math.round(num(row.return_cost)) }
 }
 
 export function procurementStats() {

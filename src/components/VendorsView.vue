@@ -10,6 +10,10 @@ const types = ['餐饮', '纪念品', '饮品']
 const list = computed(() => store.vendors)
 const typeIcon = t => ({ '餐饮':'🍔', '饮品':'🥤', '纪念品':'🎁' }[t])
 
+// 联营状态：按合同表标注履约中/已终止（租金 0 且有合同即为联营铺）
+const partnerContractOf = (id) => store.partnerContracts.find(c => c.vendor_id === id && c.status === 'active')
+const partnerEndedOf = (id) => store.partnerContracts.find(c => c.vendor_id === id && c.status === 'terminated')
+
 // 库存联动：商铺所挂物资的最低库存状态（未挂物资=不受库存管理）
 function vStock(v) {
   const linked = store.materials.filter(m => m.vendors.some(x => x.id === v.id))
@@ -44,12 +48,14 @@ function submit() {
           <span class="inv-badge" :class="vStock(v)?.worst || 'none'" :title="vStock(v) ? vStock(v).linked.map(m=>m.name+'('+m.qty_on_hand+')').join('、') : '未挂物资，不受库存联动'">
             {{ vStock(v) ? (vStock(v).worst==='out' ? '📦 断货' : vStock(v).worst==='low' ? '📦 偏低' : '📦 充足') : '未管库存' }}
           </span>
+          <span v-if="partnerContractOf(v.id)" class="partner-badge" :title="'联营扣点 ' + Math.round(partnerContractOf(v.id).commission_rate*100) + '%，按流水分账不收租'">🤝 联营 {{ Math.round(partnerContractOf(v.id).commission_rate*100) }}%</span>
+          <span v-else-if="partnerEndedOf(v.id)" class="partner-badge ended">已解约</span>
           <button class="ghost danger" @click="store.delVendor(v.id)">✕</button>
         </div>
         <div class="vmeta">
           <div><em>单价</em><b class="money">{{ v.price }}</b></div>
           <div><em>毛利率</em><b>{{ Math.round(v.margin*100) }}%</b></div>
-          <div><em>月租</em><b class="money neg">{{ v.rent }}</b></div>
+          <div><em>月租</em><b :class="partnerContractOf(v.id) ? 'partner-rent' : 'money neg'">{{ partnerContractOf(v.id) ? '联营免租' : v.rent }}</b></div>
         </div>
         <div class="vbottom">
           <span class="muted">累计售出 {{ v.sold }} 件</span><span class="money">¥{{ v.rev.toLocaleString() }}</span>
@@ -97,6 +103,9 @@ function submit() {
 .inv-badge.low { color: var(--accent2); border-color: rgba(255,209,102,.4); background: rgba(255,209,102,.12); }
 .inv-badge.out { color: var(--red); border-color: rgba(255,107,107,.45); background: rgba(255,107,107,.15); }
 .inv-badge.none { color: var(--muted); }
+.partner-badge { font-size: 11px; padding: 2px 8px; border-radius: 20px; color: var(--purple); border: 1px solid rgba(167,139,250,.5); background: rgba(167,139,250,.12); white-space: nowrap; }
+.partner-badge.ended { color: var(--muted); border-color: var(--border); background: var(--panel2); }
+.partner-rent { color: var(--purple); font-size: 13px; }
 .vmeta { display: flex; gap: 8px; margin: 12px 0; }
 .vmeta div { background: var(--panel2); flex: 1; text-align: center; border-radius: 8px; padding: 8px; }
 .vmeta em { display: block; font-style: normal; font-size: 11px; color: var(--muted); }

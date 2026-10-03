@@ -1005,6 +1005,156 @@ CREATE TABLE IF NOT EXISTS purchase_logs (
   note TEXT NOT NULL DEFAULT '',
   staff_id INTEGER
 );
+
+-- ========================================================================
+-- 园区联营商户结算：
+--   商户申请入驻（新商户或存量商铺转联营）→ 审核签约（分成率/账期/保证金）
+--   → 按销售流水实时分账（会员优惠按约分摊、消费券营销成本园方承担）
+--   → 库存联动（FEFO 批次成本结算时扣收）→ 投诉处理（现金补偿按责罚没）
+--   → 退货退款（红冲流水）→ 周期账单（生成/支付/挂账）
+-- 联营商铺营收为「代收代付」：现金进园方账户形成对商户负债，账单支付时清偿。
+-- ========================================================================
+
+-- 入驻申请：status=applied 待审核 / approved 已通过签约 / rejected 已驳回 / withdrawn 已撤回
+CREATE TABLE IF NOT EXISTS partner_applications (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL DEFAULT '',           -- LY0001
+  vendor_id INTEGER,                       -- 存量商铺转联营时关联；新商户签约时回写
+  name TEXT NOT NULL,                      -- 商户/品牌名称
+  contact TEXT NOT NULL DEFAULT '',        -- 联系人
+  phone TEXT NOT NULL DEFAULT '',
+  type TEXT NOT NULL DEFAULT '餐饮',       -- 餐饮/纪念品/饮品
+  zone_id INTEGER NOT NULL DEFAULT 1,
+  license TEXT NOT NULL DEFAULT '',        -- 营业执照/资质编号
+  proposal TEXT NOT NULL DEFAULT '',       -- 经营方案/拟售商品
+  commission_rate REAL NOT NULL DEFAULT 0.2, -- 申请分成率（园方扣点，0-1）
+  settle_period_days INTEGER NOT NULL DEFAULT 7, -- 期望结算周期（天）
+  deposit INTEGER NOT NULL DEFAULT 5000,   -- 保证金
+  status TEXT NOT NULL DEFAULT 'applied',  -- applied/approved/rejected/withdrawn
+  reject_reason TEXT NOT NULL DEFAULT '',
+  contract_id INTEGER,                     -- 审核通过后生成的合同
+  applicant_staff_id INTEGER,              -- 登记员工（招商专员/运营主管）
+  reviewer_id INTEGER,                     -- 审核员工
+  create_day INTEGER NOT NULL DEFAULT 0,
+  create_tick INTEGER NOT NULL DEFAULT 0,
+  review_day INTEGER NOT NULL DEFAULT 0,
+  review_tick INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_papp_status ON partner_applications(status);
+
+-- 联营合同：status=active 履约中 / terminated 已终止 / expired 到期未续
+CREATE TABLE IF NOT EXISTS partner_contracts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL DEFAULT '',           -- HT0001
+  application_id INTEGER,
+  vendor_id INTEGER NOT NULL,
+  commission_rate REAL NOT NULL DEFAULT 0.2, -- 园方分成（扣点）
+  member_discount_share REAL NOT NULL DEFAULT 1, -- 会员优惠商户承担比例 0-1（其余园方承担）
+  settle_period_days INTEGER NOT NULL DEFAULT 7, -- 结算周期
+  deposit INTEGER NOT NULL DEFAULT 5000,   -- 保证金（签约时收取，终止清算时按约定退还/扣没）
+  start_day INTEGER NOT NULL DEFAULT 0,
+  end_day INTEGER NOT NULL DEFAULT 0,      -- 0=长期有效
+  status TEXT NOT NULL DEFAULT 'active',   -- active/terminated
+  sign_day INTEGER NOT NULL DEFAULT 0,
+  sign_tick INTEGER NOT NULL DEFAULT 0,
+  end_settlement_id INTEGER,               -- 终止清算账单
+  signer_id INTEGER,
+  note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_pcontract_vendor ON partner_contracts(vendor_id,status);
+
+-- 联营销售流水（退货为负向红冲行，与正向行同表；settlement_id=0 表示未入账）
+CREATE TABLE IF NOT EXISTS partner_sales (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL DEFAULT '',           -- LS0001
+  vendor_id INTEGER NOT NULL,
+  contract_id INTEGER NOT NULL,
+  member_id INTEGER,                       -- 会员消费（散客 NULL）
+  source TEXT NOT NULL DEFAULT 'organic',  -- organic 散客 tick / member 会员消费
+  qty REAL NOT NULL DEFAULT 0,             -- 正数=销售，负数=退货红冲
+  gross INTEGER NOT NULL DEFAULT 0,        -- 牌价金额（退货按牌价，负数）
+  bill_amount INTEGER NOT NULL DEFAULT 0,  -- 实际账单金额（含会员折扣后；红冲按实际退款额，负数）
+  member_discount INTEGER NOT NULL DEFAULT 0, -- 会员优惠额（牌价-账单），商户按约分摊
+  merchant_share INTEGER NOT NULL DEFAULT 0,  -- 商户应得（账单金额×(1-扣点)）
+  park_share INTEGER NOT NULL DEFAULT 0,      -- 园方扣点（账单金额×扣点）
+  merchant_discount_borne INTEGER NOT NULL DEFAULT 0, -- 会员优惠商户承担部分（结算时从应得扣减）
+  park_discount_borne INTEGER NOT NULL DEFAULT 0,     -- 会员优惠园方承担部分（营销成本已在会员侧入账）
+  commission_rate REAL NOT NULL DEFAULT 0.2,
+  member_discount_share REAL NOT NULL DEFAULT 1,
+  kind TEXT NOT NULL DEFAULT 'sale',       -- sale 销售 / return 退货红冲
+  origin_sale_id INTEGER,                  -- 退货红冲关联原销售流水
+  complaint_id INTEGER,                    -- 退货联动投诉（如有）
+  settlement_id INTEGER NOT NULL DEFAULT 0,
+  day INTEGER NOT NULL DEFAULT 0,
+  tick INTEGER NOT NULL DEFAULT 0,
+  note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_psales_vendor_day ON partner_sales(vendor_id,day);
+CREATE INDEX IF NOT EXISTS idx_psales_settle ON partner_sales(settlement_id,kind);
+CREATE INDEX IF NOT EXISTS idx_psales_origin ON partner_sales(origin_sale_id) WHERE kind='return';
+
+-- 联营投诉处罚：投诉结案现金补偿且责任在联营商户时，按 severity 罚没商户待结算款（园方收入）
+CREATE TABLE IF NOT EXISTS partner_fines (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL DEFAULT '',           -- CF0001
+  vendor_id INTEGER NOT NULL,
+  contract_id INTEGER NOT NULL,
+  complaint_id INTEGER NOT NULL,
+  severity INTEGER NOT NULL DEFAULT 1,
+  amount INTEGER NOT NULL DEFAULT 0,       -- 罚没金额（正数，结算时扣减）
+  comp_cost INTEGER NOT NULL DEFAULT 0,    -- 客诉现金补偿额（处罚基数参考）
+  reason TEXT NOT NULL DEFAULT '',
+  settlement_id INTEGER NOT NULL DEFAULT 0,
+  day INTEGER NOT NULL DEFAULT 0,
+  tick INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_pfines_vendor ON partner_fines(vendor_id,settlement_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pfines_complaint ON partner_fines(complaint_id);
+
+-- 联营结算账单：按合同周期汇总未入账流水/红冲/罚没/批次成本，draft→paid（现金不足自动 overdue）
+CREATE TABLE IF NOT EXISTS partner_settlements (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL DEFAULT '',           -- JS0001
+  vendor_id INTEGER NOT NULL,
+  contract_id INTEGER NOT NULL,
+  period_from INTEGER NOT NULL,
+  period_to INTEGER NOT NULL,
+  sale_count INTEGER NOT NULL DEFAULT 0,   -- 周期净销量（含红冲）
+  gross INTEGER NOT NULL DEFAULT 0,        -- 周期净牌价额
+  bill_amount INTEGER NOT NULL DEFAULT 0,  -- 周期净账单额（实际成交）
+  merchant_share INTEGER NOT NULL DEFAULT 0,  -- 销售分账商户应得
+  park_share INTEGER NOT NULL DEFAULT 0,      -- 园方扣点
+  member_discount INTEGER NOT NULL DEFAULT 0, -- 会员优惠合计
+  merchant_discount_borne INTEGER NOT NULL DEFAULT 0, -- 会员优惠商户承担
+  cogs INTEGER NOT NULL DEFAULT 0,         -- 消耗园区库存批次成本（FEFO 汇总，商户承担）
+  fines INTEGER NOT NULL DEFAULT 0,        -- 投诉罚没合计
+  deposit_offset INTEGER NOT NULL DEFAULT 0,-- 保证金抵扣（终止清算扣没）
+  deposit_refund INTEGER NOT NULL DEFAULT 0,-- 保证金退还（终止清算随账支付给商户）
+  payable INTEGER NOT NULL DEFAULT 0,      -- 应付款 = 商户应得 - 商户承担优惠 - 成本 - 罚没 - 保证金抵扣 + 保证金退还（>=0）
+  source TEXT NOT NULL DEFAULT 'periodic', -- periodic 周期账 / terminate 终止清算
+  status TEXT NOT NULL DEFAULT 'draft',    -- draft 待支付 / paid 已支付 / overdue 资金不足挂账
+  pay_day INTEGER NOT NULL DEFAULT 0,
+  pay_tick INTEGER NOT NULL DEFAULT 0,
+  create_day INTEGER NOT NULL DEFAULT 0,
+  create_tick INTEGER NOT NULL DEFAULT 0,
+  note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_psettle_vendor ON partner_settlements(vendor_id,id);
+CREATE INDEX IF NOT EXISTS idx_psettle_status ON partner_settlements(status);
+
+-- 联营台账日志：申请/审核/签约/终止/出账/支付全流程留痕
+CREATE TABLE IF NOT EXISTS partner_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ref_type TEXT NOT NULL DEFAULT '',       -- application/contract/settlement/sale
+  ref_id INTEGER NOT NULL DEFAULT 0,
+  vendor_id INTEGER,
+  tick INTEGER NOT NULL DEFAULT 0,
+  day INTEGER NOT NULL DEFAULT 0,
+  action TEXT NOT NULL,
+  note TEXT NOT NULL DEFAULT '',
+  staff_id INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_plogs_ref ON partner_logs(ref_type,ref_id);
 `)
 
 // ---------- 轻量列迁移（兼容老库） ----------

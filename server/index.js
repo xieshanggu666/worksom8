@@ -56,12 +56,24 @@ import {
   initProcurementContext, processProcurementTick,
   listSuppliers, supplierDetail, saveSupplier,
   listMaterials, materialMovements, saveMaterial, setVendorMaterials, autoLinkVendor,
-  applyVendorSales, reserveVendorStock, customerReturn,
+  applyVendorSales, reserveVendorStock, customerReturn, partnerCogs,
   createOrder, submitOrder, approveOrder, rejectOrder, receiveOrder, payOrder, purchaseReturn,
   listOrders, orderDetail, listBatches, listReturns,
   createStocktake, submitStocktake, approveStocktake, cancelStocktake, listStocktakes, stocktakeDetail,
   listInventoryFindings, resolveInventoryFinding, ignoreInventoryFinding, procurementStats
 } from './procurement.js'
+import {
+  initPartnerContext,
+  applyPartner, withdrawApplication, approveApplication, rejectApplication,
+  listApplications, applicationDetail,
+  listContracts, contractDetail, terminateContract, activeContract as activePartnerContract,
+  recordSale as partnerRecordSale, isPartnerVendor,
+  organicReturn, recordReturn as partnerRecordReturn,
+  levyComplaintFine,
+  issueSettlement, paySettlement, retryOverdueSettlements, autoIssueSettlements,
+  listSales as listPartnerSales, listSettlements, settlementDetail, listFines,
+  partnerStats, PARTNER_CONST
+} from './partners.js'
 
 const app = express()
 app.use(express.json())
@@ -137,10 +149,22 @@ initSchedulingContext({
 initMemberContext({
   logFinance,
   // 会员商铺消费前先校验并冻结库存：库存不足直接整单失败（与支付同一事务，不发生扣款成功却无货）
-  reserveVendorStock: (vendorId, qty) => reserveVendorStock(vendorId, qty)
+  // 联营商铺按联营模式打标扣库存（批次成本随结算扣收，流水记 partner_sale）
+  reserveVendorStock: (vendorId, qty) => reserveVendorStock(vendorId, qty, { partner: isPartnerVendor(vendorId) }),
+  // 联营分账钩子：会员在联营商铺消费成交后，按合同扣点/会员优惠分摊写流水（在会员支付事务内）
+  partnerSaleHook: (vendorId, payload) => partnerRecordSale(vendorId, { ...payload, source: 'member' })
 })
 // 物资采购与库存：财务流水（采购付款/退货/报损/盘亏）
 initProcurementContext({ logFinance })
+// 园区联营商户结算：注入库存/退货/批次成本与财务流水，接线销售分账、库存消耗与结算
+initPartnerContext({
+  logFinance,
+  applyVendorSales: (vendorId, qty) => applyVendorSales(vendorId, qty, { partner: true }),
+  reserveVendorStock: (vendorId, qty) => reserveVendorStock(vendorId, qty, { partner: true }),
+  customerReturn: (vendorId, qty, opts) => customerReturn(vendorId, qty, { ...opts, partner: true }),
+  partnerCogs: (vendorId, from, to) => partnerCogs(vendorId, from, to),
+  autoLinkVendor: (vendorId, type) => autoLinkVendor(vendorId, type)
+})
 // 设施域服务：时钟 / 现金 / 财务流水（升级扣款与流水同事务原子提交）
 initRideContext({ logFinance })
 // 预约 ↔ 会员双向联动：预约侧注入会员报价/下单/退款回调；会员侧绑定会员模拟下单入口
@@ -512,7 +536,17 @@ function doResolveComplaint(id, compKey, auto = false) {
   logComplaint(id, 'resolve', `${auto ? '系统自动' : '确认'}补偿「${opt.name}」${cost ? `，支出 ¥${cost}` : ''}${pointsAwarded ? `，发放 ${pointsAwarded} 积分` : ''}，游客评价 ${rating} 星`, st?.id ?? null)
   // 完工回写排班工时模块：当值受理员工本班满意度 +2（结算时落士气与工资）
   if (st) writeWorkCompletion(st.id, 'complaint', { code: c.code })
-  return { ok: true, rating, cost, points: pointsAwarded }
+  // 联营联动：现金补偿结案且责任在联营商户时，按严重度罚没商户待结算款（园区收回补偿成本）
+  // 幂等：同一投诉已生成过罚没则不重复（结案更新已落库，仅补偿后置环节失败重试时保护）
+  let partnerFine = null
+  if (cost > 0) {
+    const dupFine = db.prepare('SELECT id FROM partner_fines WHERE complaint_id=?').get(id)
+    if (!dupFine) {
+      try { partnerFine = levyComplaintFine({ ...c, comp_cost: cost }) } catch (e) { console.error('[partners] 投诉罚没失败:', e) }
+      if (partnerFine) logComplaint(id, 'resolve', `联营商户责任，按严重度罚没待结算款 ¥${partnerFine.amount}`, st?.id ?? null)
+    }
+  }
+  return { ok: true, rating, cost, points: pointsAwarded, partnerFine }
 }
 
 // 不予补偿直接结案：游客不满，声誉与口碑受损
@@ -646,10 +680,21 @@ function tick() {
         .run(state.tick(), day, 'staff', '员工旷工预警',
           `今日有 ${wageSummary.absent} 名排班员工未打卡上班，已按旷工处理（无薪并扣减满意度）。运营主管请核查排班覆盖与人员安排。`, -1, 'active')
     }
-    // 日结租金
-    const rent = allVendors().reduce((s, v) => s + v.rent, 0)
+    // 日结租金：联营商铺按销售流水分账，不收固定租金（rent 签约时已置 0）；仅自营商铺收租
+    const rent = allVendors().filter(v => !isPartnerVendor(v.id)).reduce((s, v) => s + v.rent, 0)
     cash -= rent
-    logFinance(day, '租金', -rent, '当日商铺租金')
+    logFinance(day, '租金', -rent, '当日自营商铺租金（联营按流水分账，不收租）')
+    // 联营商户结算：账期到期自动生成结算账单（draft，不自动付款）；先补付历史挂账单
+    try {
+      const retry = retryOverdueSettlements()
+      if (retry.count > 0) logFinance(day, '商户结算', -retry.paid, `补付 ${retry.count} 张联营挂账账单`)
+      const issued = autoIssueSettlements(day)
+      if (issued.length) {
+        db.prepare('INSERT INTO events(tick,day,type,title,desc,impact,status) VALUES(?,?,?,?,?,?,?)')
+          .run(state.tick(), day, 'partner', '联营账期结算单已生成',
+            `${issued.length} 家联营商户账期到期，已自动生成结算账单，请在「联营商户」页核对并支付。`, 0, 'resolved')
+      }
+    } catch (e) { console.error('[partners] 日结联营出账失败:', e) }
     // 日结分期贷款：同步扣款；现金不足时按 利息→本金 部分偿还并转逾期挂账
     const settled = settleLoans(cash, day)
     cash = settled.cash
@@ -777,15 +822,31 @@ function tick() {
     const zone = zones.find(z => z.id === v.zone_id)
     const zFlow = (zone ? zone.capacity : 150) * (satisfaction / 100)
     const demand = Math.round(Math.min(zFlow / 8, entering / 6) * (0.8 + Math.random() * 0.4))
-    // applyVendorSales 内部事务扣减批次库存；库存不足时 sold 截断为可售量，lost 记缺货流失
-    const cap = applyVendorSales(v.id, demand)
-    const sold = cap.sold
-    const income = Math.round(sold * v.price * v.margin)
-    vendorIncome += income
-    cash += income
-    vStmt.run(sold, income, v.id)
+    const partnerContract = isPartnerVendor(v) ? activePartnerContract(v.id) : null
+    if (partnerContract) {
+      // 联营商铺：销售扣库存（partner_sale 批次成本随结算扣收）+ 按销售流水分账，与现金/库存同事务
+      tx(() => {
+        // applyVendorSales 内部嵌套事务并入外层；联营模式打标扣减
+        const cap = applyVendorSales(v.id, demand, { partner: true })
+        if (cap.sold <= 0) return
+        const gross = Math.round(cap.sold * v.price)
+        // 散客无会员优惠：账单额=牌价；园方代收全额现金，扣点归园方、余额为对商户负债（结算时支付）
+        partnerRecordSale(v.id, { qty: cap.sold, gross, bill: gross, source: 'organic', note: '散客 tick 销售' })
+        cash += gross
+        vendorIncome += gross
+        vStmt.run(cap.sold, gross, v.id)
+      })
+    } else {
+      // 自营商铺：applyVendorSales 内部事务扣减批次库存；库存不足时 sold 截断为可售量，lost 记缺货流失
+      const cap = applyVendorSales(v.id, demand)
+      const sold = cap.sold
+      const income = Math.round(sold * v.price * v.margin)
+      vendorIncome += income
+      cash += income
+      vStmt.run(sold, income, v.id)
+    }
   }
-  if (vendorIncome > 0) logFinance(day, '商业', vendorIncome, '商铺营收')
+  if (vendorIncome > 0) logFinance(day, '商业', vendorIncome, '商铺营收（含联营代收）')
 
   // 需求侧：模拟游客为未来三天的入园/设施时段下单预约（预收款即入账）
   autoBookDemand(allRides(), base, priceFactor, repFactor * complaintFactor)
@@ -1056,6 +1117,13 @@ app.get('/api/state', (req, res) => {
     stockBatches: listBatches({ expiring: true, limit: 50 }),
     stocktakes: listStocktakes({ limit: 30 }),
     purchaseReturns: listReturns({ limit: 50 }),
+    // 园区联营商户结算
+    partnerStats: partnerStats(),
+    partnerApplications: listApplications({ limit: 50 }),
+    partnerContracts: listContracts({ limit: 50 }),
+    partnerSales: listPartnerSales({ limit: 60 }),
+    partnerSettlements: listSettlements({ limit: 50 }),
+    partnerConst: { periodChoices: PARTNER_CONST.PERIOD_CHOICES, fineMul: PARTNER_CONST.FINE_MUL, fineMin: PARTNER_CONST.FINE_MIN },
     avgs: {
       satisfaction: computeSatisfaction(),
       openRatio: rides.length ? operatingRides().length / rides.length : 0
@@ -1210,6 +1278,81 @@ app.delete('/api/vendors/:id', (req, res) => {
   res.json({ ok: true })
 })
 
+// ---- 园区联营商户：入驻申请 → 审核签约 → 销售分账 → 结算账单 ----
+// 入驻申请（新商户 / 存量商铺转联营）
+app.get('/api/partner/applications', (req, res) =>
+  res.json({ ok: true, list: listApplications({ status: req.query.status || null }) }))
+app.get('/api/partner/applications/:id', (req, res) => {
+  const d = applicationDetail(num(req.params.id))
+  if (!d) return res.status(404).json({ ok: false, msg: '申请不存在' })
+  res.json({ ok: true, data: d })
+})
+app.post('/api/partner/applications', (req, res) =>
+  reply(req, res, applyPartner({ ...(req.body || {}), applicant_staff_id: num(req.body?.applicant_staff_id) || null })))
+app.post('/api/partner/applications/:id/withdraw', (req, res) =>
+  reply(req, res, withdrawApplication(num(req.params.id), { staffId: num(req.body?.staff_id) || null })))
+app.post('/api/partner/applications/:id/approve', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, approveApplication(num(req.params.id), {
+    staffId: num(b.staff_id) || null,
+    commissionRate: b.commission_rate === undefined || b.commission_rate === '' ? null : num(b.commission_rate),
+    period: b.settle_period_days ? num(b.settle_period_days) : null,
+    deposit: b.deposit === undefined || b.deposit === '' ? null : num(b.deposit),
+    memberDiscountShare: b.member_discount_share === undefined || b.member_discount_share === '' ? null : num(b.member_discount_share),
+    endDay: num(b.end_day)
+  }))
+})
+app.post('/api/partner/applications/:id/reject', (req, res) =>
+  reply(req, res, rejectApplication(num(req.params.id), { reason: req.body?.reason || '', staffId: num(req.body?.staff_id) || null })))
+
+// 合同
+app.get('/api/partner/contracts', (req, res) =>
+  res.json({ ok: true, list: listContracts({ status: req.query.status || null, vendorId: req.query.vendor_id ? num(req.query.vendor_id) : null }) }))
+app.get('/api/partner/contracts/:id', (req, res) => {
+  const d = contractDetail(num(req.params.id))
+  if (!d) return res.status(404).json({ ok: false, msg: '合同不存在' })
+  res.json({ ok: true, ...d })
+})
+app.post('/api/partner/contracts/:id/terminate', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, terminateContract(num(req.params.id), {
+    reason: b.reason || '', forfeitDeposit: !!b.forfeit_deposit, staffId: num(b.staff_id) || null
+  }))
+})
+
+// 销售流水 / 退货红冲
+app.get('/api/partner/sales', (req, res) => {
+  const q = req.query || {}
+  res.json({ ok: true, list: listPartnerSales({
+    vendorId: q.vendor_id ? num(q.vendor_id) : null, kind: q.kind || null,
+    unsettledOnly: q.unsettled === '1', limit: num(q.limit, 100)
+  }) })
+})
+app.post('/api/partner/sales/:id/return', (req, res) => {
+  // 指定原单的会员联营退货：仅红冲分账（退款/库存走会员退货或前台销售退货入口）
+  const b = req.body || {}
+  const sale = db.prepare('SELECT vendor_id FROM partner_sales WHERE id=?').get(num(req.params.id))
+  if (!sale) return res.status(404).json({ ok: false, msg: '销售流水不存在' })
+  reply(req, res, partnerRecordReturn(sale.vendor_id, num(req.params.id), {
+    qty: num(b.qty, 1), refund: num(b.refund), complaintId: num(b.complaint_id) || null, note: b.note || ''
+  }))
+})
+app.get('/api/partner/fines', (req, res) =>
+  res.json({ ok: true, list: listFines({ vendorId: req.query.vendor_id ? num(req.query.vendor_id) : null, unsettledOnly: req.query.unsettled === '1' }) }))
+
+// 结算账单
+app.get('/api/partner/settlements', (req, res) =>
+  res.json({ ok: true, list: listSettlements({ status: req.query.status || null, vendorId: req.query.vendor_id ? num(req.query.vendor_id) : null }) }))
+app.get('/api/partner/settlements/:id', (req, res) => {
+  const d = settlementDetail(num(req.params.id))
+  if (!d) return res.status(404).json({ ok: false, msg: '账单不存在' })
+  res.json({ ok: true, ...d })
+})
+app.post('/api/partner/contracts/:id/settle', (req, res) =>
+  reply(req, res, issueSettlement(num(req.params.id), { note: req.body?.note || '' })))
+app.post('/api/partner/settlements/:id/pay', (req, res) =>
+  reply(req, res, paySettlement(num(req.params.id), { staffId: num(req.body?.staff_id) || null })))
+
 // ---- 物资采购与库存 ----
 // 供应商
 app.get('/api/suppliers', (req, res) => res.json({ ok: true, list: listSuppliers({ status: req.query.status || null }) }))
@@ -1245,10 +1388,23 @@ app.post('/api/purchase-orders/:id/receive', (req, res) =>
 app.post('/api/purchase-orders/:id/pay', (req, res) =>
   reply(req, res, payOrder(num(req.params.id), num(req.body?.amount))))
 
-// 退货：purchase=采购退供应商；sale=游客销售退货回补+退款
+// 退货：purchase=采购退供应商；sale=游客销售退货回补+退款（联营商户同时红冲分账流水）
 app.post('/api/purchase-returns', (req, res) => reply(req, res, purchaseReturn(req.body || {})))
-app.post('/api/sales-returns', (req, res) =>
-  reply(req, res, customerReturn(num(req.body?.vendor_id), num(req.body?.qty), { reason: req.body?.reason || '' })))
+app.post('/api/sales-returns', (req, res) => {
+  const vendorId = num(req.body?.vendor_id)
+  const qty = num(req.body?.qty)
+  const partner = isPartnerVendor(vendorId)
+  // 联营退货：采购事务回补库存（partner_sale_return）成功后，再写负向分账流水
+  const r = customerReturn(vendorId, qty, { reason: req.body?.reason || '', partner })
+  if (r.ok && partner) {
+    const pr = organicReturn(vendorId, qty, {
+      refund: r.refund, complaintId: num(req.body?.complaint_id) || null, reason: req.body?.reason || ''
+    })
+    if (!pr.ok) return reply(req, res, pr)
+    r.partner_return = pr
+  }
+  reply(req, res, r)
+})
 app.get('/api/purchase-returns', (req, res) => res.json({ ok: true, list: listReturns({ kind: req.query.kind || null }) }))
 
 // 入库批次
